@@ -14,7 +14,7 @@ import shutil
 import subprocess
 from typing import Any
 
-from .patcher import ALLOWED_ATTRS
+from .patcher import ALLOWED_ATTRS, ALLOWED_YAML_KEYS
 
 
 def _tf_binary() -> str | None:
@@ -25,14 +25,20 @@ def _tf_binary() -> str | None:
 
 
 def lint_hcl_files(files: list[str]) -> dict[str, Any]:
+    """Parse-lint modified files: HCL2 for *.tf/*.tfvars, YAML for *.yaml/yml."""
     import hcl2
+    import yaml
 
     results = {}
     ok = True
     for path in sorted(set(files)):
         try:
-            with open(path, encoding="utf-8") as f:
-                hcl2.load(f)
+            if path.endswith((".yaml", ".yml")):
+                with open(path, encoding="utf-8") as f:
+                    yaml.safe_load(f)
+            else:
+                with open(path, encoding="utf-8") as f:
+                    hcl2.load(f)
             results[path] = "ok"
         except Exception as e:
             results[path] = f"parse error: {e}"
@@ -74,7 +80,10 @@ def check_diff_scope(repo_path: str) -> dict[str, Any]:
     if proc.returncode != 0:
         return {"passed": False, "error": proc.stderr.strip() or "git diff failed"}
 
-    violations = []
+    # Collect changed lines per file, then cancel identical added/removed
+    # pairs: git's hunk alignment can render adjacent edits as a "move" of an
+    # untouched line (e.g. a YAML mapping header), which is not a real change.
+    changed: list[tuple[str, str, str]] = []  # (file, sign, body)
     current_file = None
     for line in proc.stdout.splitlines():
         if line.startswith("+++ b/"):
@@ -82,9 +91,44 @@ def check_diff_scope(repo_path: str) -> dict[str, Any]:
             continue
         if not (line.startswith("+") or line.startswith("-")) or line.startswith(("+++", "---")):
             continue
-        body = line[1:].strip()
+        changed.append((current_file or "", line[0], line[1:]))
+
+    from collections import Counter
+
+    added = Counter((f, b) for f, s, b in changed if s == "+")
+    removed = Counter((f, b) for f, s, b in changed if s == "-")
+    moved = added & removed  # multiset intersection = pure moves
+
+    # net changes: subtract moved counts from each side
+    net = []
+    seen_add: Counter = Counter()
+    seen_rem: Counter = Counter()
+    for f, s, b in changed:
+        key = (f, b)
+        if s == "+":
+            seen_add[key] += 1
+            if seen_add[key] <= moved.get(key, 0):
+                continue
+        else:
+            seen_rem[key] += 1
+            if seen_rem[key] <= moved.get(key, 0):
+                continue
+        net.append((f, s, b))
+
+    violations = []
+    for current_file, sign, raw_body in net:
+        line = sign + raw_body
+        body = raw_body.strip()
         if not body or body.startswith("#"):
             continue
+
+        # YAML values files: changed lines must be allowlisted rightsizing keys
+        if current_file and current_file.endswith((".yaml", ".yml")):
+            ym = re.match(r'^([A-Za-z0-9_.-]+)\s*:', body)
+            if not ym or ym.group(1) not in ALLOWED_YAML_KEYS:
+                violations.append({"file": current_file, "line": line})
+            continue
+
         m = re.match(r'^([A-Za-z_][A-Za-z0-9_]*)\s*=', body)
         if not m:
             violations.append({"file": current_file, "line": line})

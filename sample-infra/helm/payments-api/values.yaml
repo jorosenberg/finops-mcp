@@ -1,0 +1,24 @@
+# Helm values for the payments-api deployment (EKS).
+
+replicaCount: 3
+
+image:
+  repository: 123456789012.dkr.ecr.us-east-1.amazonaws.com/payments-api
+  tag: "1.14.2"
+
+# PROTECTED: secret-looking keys are never modified by automation
+apiToken: "placeholder-injected-by-external-secrets"
+
+resources:
+  requests:
+    cpu: 500m
+    memory: 1Gi
+  limits:
+    cpu: 1000m
+    memory: 2Gi
+
+autoscaling:
+  enabled: true
+  minReplicas: 3
+  maxReplicas: 20
+  targetCPUUtilizationPercentage: 70
