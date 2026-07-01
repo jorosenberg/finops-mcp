@@ -19,11 +19,15 @@ SKIP_DIRS = {".git", ".terraform", "node_modules", "__pycache__"}
 TARGET_ATTRS = {
     "eks_nodegroup": ["instance_types", "min_size", "max_size", "desired_size"],
     "rds_instance": ["instance_class", "allocated_storage"],
+    "ecs_service": ["cpu", "memory", "desired_count"],
+    "lambda_function": ["memory_size"],
 }
 
 RESOURCE_BLOCK_TYPES = {
     "eks_nodegroup": ["aws_eks_node_group"],
     "rds_instance": ["aws_db_instance", "aws_rds_cluster_instance"],
+    "ecs_service": ["aws_ecs_task_definition", "aws_ecs_service"],
+    "lambda_function": ["aws_lambda_function"],
 }
 
 
@@ -117,6 +121,40 @@ def _trace_variable(repo_path: str, var_expr: str) -> Optional[dict[str, Any]]:
     return None
 
 
+def _map_helm_workload(repo_path: str, rec: dict[str, Any]) -> dict[str, Any]:
+    """Locate the Helm values.yaml governing a K8s workload. Matches a values
+    file whose parent chart directory is named after the workload, or whose
+    content references the workload name."""
+    name = rec["resource_name"]
+    candidates = []
+    for path in _iter_files(repo_path):
+        if os.path.basename(path) not in HELM_FILENAMES:
+            continue
+        parts = os.path.normpath(path).split(os.sep)
+        if name in parts:
+            candidates.insert(0, path)  # dir-name match is strongest
+            continue
+        content = open(path, encoding="utf-8").read()
+        if re.search(re.escape(name), content):
+            candidates.append(path)
+
+    if not candidates:
+        return {
+            "found": False,
+            "error": f"no values.yaml found for k8s workload '{name}' in {repo_path}",
+        }
+    return {
+        "found": True,
+        "resource_type": "k8s_workload",
+        "kind": "helm_values",
+        "values_file": candidates[0],
+        "attributes": {
+            key: {"file": candidates[0], "location": "yaml_path", "yaml_path": key}
+            for key in rec["recommended"]
+        },
+    }
+
+
 def map_recommendation_to_code(repo_path: str, rec: dict[str, Any]) -> dict[str, Any]:
     """Locate the declaration of the recommended resource and, per attribute,
     the exact file/expression to patch (following variable indirection)."""
@@ -124,8 +162,16 @@ def map_recommendation_to_code(repo_path: str, rec: dict[str, Any]) -> dict[str,
     if not os.path.isdir(repo_path):
         return {"found": False, "error": f"repo path does not exist: {repo_path}"}
 
+    if rec["resource_type"] == "k8s_workload":
+        return _map_helm_workload(repo_path, rec)
+
     block_types = RESOURCE_BLOCK_TYPES.get(rec["resource_type"], [])
     attrs = TARGET_ATTRS.get(rec["resource_type"], [])
+
+    # Accumulate matches across blocks/files: e.g. ECS cpu/memory live on the
+    # task definition while desired_count lives on the service.
+    attr_map: dict[str, Any] = {}
+    first_block: Optional[dict[str, Any]] = None
 
     for path in _iter_files(repo_path):
         if not path.endswith(".tf"):
@@ -145,8 +191,16 @@ def map_recommendation_to_code(repo_path: str, rec: dict[str, Any]) -> dict[str,
                 if not _block_matches_resource(block_text, rec):
                     continue
 
-                attr_map = {}
+                if first_block is None:
+                    first_block = {
+                        "terraform_type": btype,
+                        "terraform_name": header.group(1),
+                        "declaration_file": path,
+                    }
+
                 for attr in attrs:
+                    if attr in attr_map:
+                        continue
                     raw_value = _extract_attr(block_text, attr)
                     if raw_value is None:
                         continue
@@ -154,6 +208,8 @@ def map_recommendation_to_code(repo_path: str, rec: dict[str, Any]) -> dict[str,
                         "file": path,
                         "location": "inline",
                         "current_expression": raw_value,
+                        "terraform_type": btype,
+                        "terraform_name": header.group(1),
                     }
                     traced = _trace_variable(repo_path, raw_value)
                     if traced:
@@ -167,14 +223,13 @@ def map_recommendation_to_code(repo_path: str, rec: dict[str, Any]) -> dict[str,
                         )
                     attr_map[attr] = entry
 
-                return {
-                    "found": True,
-                    "resource_type": rec["resource_type"],
-                    "terraform_type": btype,
-                    "terraform_name": header.group(1),
-                    "declaration_file": path,
-                    "attributes": attr_map,
-                }
+    if first_block:
+        return {
+            "found": True,
+            "resource_type": rec["resource_type"],
+            **first_block,
+            "attributes": attr_map,
+        }
 
     return {
         "found": False,

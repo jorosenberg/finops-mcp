@@ -1,8 +1,8 @@
-"""Safe, minimal-diff patching of Terraform/OpenTofu files.
+"""Safe, minimal-diff patching of Terraform/OpenTofu and Helm values files.
 
 Safety prechecks enforced before any write:
 - never touch secrets, networking blocks (VPC/subnet/SG), or state backends
-- only modify allowlisted rightsizing attributes
+- only modify allowlisted rightsizing attributes / YAML keys
 - preserve formatting, comments, and surrounding blocks byte-for-byte
 """
 
@@ -22,6 +22,20 @@ ALLOWED_ATTRS = {
     "allocated_storage",
     "node_count",
     "replicas",
+    "cpu",
+    "memory",
+    "memory_size",
+    "desired_count",
+}
+
+# YAML leaf keys we may modify in Helm values files (pod/HPA rightsizing)
+ALLOWED_YAML_KEYS = {
+    "cpu",
+    "memory",
+    "minReplicas",
+    "maxReplicas",
+    "replicas",
+    "replicaCount",
 }
 
 FORBIDDEN_PATTERNS = [
@@ -33,7 +47,7 @@ FORBIDDEN_PATTERNS = [
 ]
 
 SECRET_HINTS = re.compile(
-    r'(password|secret|token|api_key|private_key|credentials)\s*=', re.IGNORECASE
+    r'(password|secret|token|api_?key|private_key|credentials)\s*[=:]', re.IGNORECASE
 )
 
 
@@ -73,11 +87,6 @@ def patch_attribute(
     block (e.g. one resource) so same-named attributes elsewhere are untouched.
     Returns {"file", "line", "old", "new", "changed"}.
     """
-    key = attr_or_var.split(".")[-1]
-    if key not in ALLOWED_ATTRS and scope_header_re is None:
-        # tfvars variables may have arbitrary names; verify content instead
-        pass
-
     content = open(file_path, encoding="utf-8").read()
 
     # Determine searchable region
@@ -141,6 +150,51 @@ def patch_attribute(
     }
 
 
+def patch_yaml_path(file_path: str, dotted_path: str, new_value: Any) -> dict[str, Any]:
+    """Replace the scalar at a dotted YAML path (e.g. resources.requests.cpu)
+    with new_value, minimal diff, preserving indentation and comments.
+
+    Only allowlisted leaf keys may be modified; secret-looking lines refuse.
+    """
+    leaf = dotted_path.split(".")[-1]
+    if leaf not in ALLOWED_YAML_KEYS:
+        raise SafetyViolation(f"yaml key '{leaf}' is not an allowlisted rightsizing key")
+
+    lines = open(file_path, encoding="utf-8").read().splitlines(keepends=True)
+    stack: list[tuple[int, str]] = []  # (indent, key)
+
+    for i, line in enumerate(lines):
+        m = re.match(r'^(\s*)([A-Za-z0-9_.-]+):(\s*)(.*?)(\s*(?:#.*)?)$', line.rstrip("\n"))
+        if not m:
+            continue
+        indent = len(m.group(1))
+        key = m.group(2)
+        while stack and stack[-1][0] >= indent:
+            stack.pop()
+        stack.append((indent, key))
+        path = ".".join(k for _, k in stack)
+
+        if path == dotted_path:
+            value = m.group(4)
+            if value == "":
+                raise SafetyViolation(
+                    f"'{dotted_path}' in {file_path} is a mapping, not a scalar"
+                )
+            check_line_safety(line)
+            new_scalar = str(new_value)
+            if value.strip() == new_scalar:
+                return {"file": file_path, "line": i + 1, "old": value.strip(),
+                        "new": new_scalar, "changed": False}
+            eol = "\n" if line.endswith("\n") else ""
+            lines[i] = f"{m.group(1)}{key}:{m.group(3) or ' '}{new_scalar}{m.group(5)}{eol}"
+            with open(file_path, "w", encoding="utf-8") as f:
+                f.writelines(lines)
+            return {"file": file_path, "line": i + 1, "old": value.strip(),
+                    "new": new_scalar, "changed": True}
+
+    raise SafetyViolation(f"yaml path '{dotted_path}' not found in {file_path}")
+
+
 def apply_recommendation(mapping: dict[str, Any], rec: dict[str, Any]) -> list[dict[str, Any]]:
     """Apply every recommended attribute change through its mapped location."""
     if rec.get("externally_managed"):
@@ -151,6 +205,17 @@ def apply_recommendation(mapping: dict[str, Any], rec: dict[str, Any]) -> list[d
     if not mapping.get("found"):
         raise SafetyViolation(mapping.get("error", "mapping failed"))
 
+    changes: list[dict[str, Any]] = []
+
+    # --- Helm values.yaml (K8s pod/HPA rightsizing) ---
+    if mapping.get("kind") == "helm_values":
+        for yaml_path, new_value in rec["recommended"].items():
+            if new_value is None or rec["current"].get(yaml_path) == new_value:
+                continue
+            changes.append(patch_yaml_path(mapping["values_file"], yaml_path, new_value))
+        return changes
+
+    # --- Terraform ---
     # recommendation key -> terraform attribute name
     key_translation = {
         "instance_type": ["instance_types", "instance_type"],
@@ -159,9 +224,12 @@ def apply_recommendation(mapping: dict[str, Any], rec: dict[str, Any]) -> list[d
         "max_size": ["max_size"],
         "desired_size": ["desired_size"],
         "allocated_storage_gb": ["allocated_storage"],
+        "cpu": ["cpu"],
+        "memory": ["memory"],
+        "memory_size": ["memory_size"],
+        "desired_count": ["desired_count"],
     }
 
-    changes = []
     attrs = mapping["attributes"]
     for rec_key, new_value in rec["recommended"].items():
         if new_value is None or rec["current"].get(rec_key) == new_value:
@@ -175,10 +243,9 @@ def apply_recommendation(mapping: dict[str, Any], rec: dict[str, Any]) -> list[d
         value: Any = [new_value] if tf_attr == "instance_types" else new_value
 
         if loc["location"] == "inline":
-            scope = (
-                rf'resource\s+"{mapping["terraform_type"]}"\s+'
-                rf'"{re.escape(mapping["terraform_name"])}"\s*'
-            )
+            tf_type = loc.get("terraform_type", mapping["terraform_type"])
+            tf_name = loc.get("terraform_name", mapping["terraform_name"])
+            scope = rf'resource\s+"{tf_type}"\s+"{re.escape(tf_name)}"\s*'
             changes.append(patch_attribute(loc["file"], tf_attr, value, scope_header_re=scope))
         elif loc["location"] == "tfvars":
             changes.append(patch_attribute(loc["file"], loc["variable"], value))
