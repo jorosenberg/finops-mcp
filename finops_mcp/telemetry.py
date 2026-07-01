@@ -17,7 +17,7 @@ SIGNIFICANT_SAVINGS_USD = float(os.environ.get("FINOPS_MIN_MONTHLY_SAVINGS", "20
 @dataclasses.dataclass
 class Recommendation:
     id: str
-    resource_type: str            # "eks_nodegroup" | "rds_instance"
+    resource_type: str            # "eks_nodegroup" | "rds_instance" | "ecs_service" | "lambda_function" | "k8s_workload"
     resource_name: str            # logical/physical name
     resource_arn: str
     region: str
@@ -83,6 +83,67 @@ MOCK_RECOMMENDATIONS: list[Recommendation] = [
         metrics={"cpu_p95_percent": 14.0, "lookback_days": 14},
         finding="Overprovisioned",
         externally_managed=True,  # lifecycle owned by Karpenter — must be skipped
+    ),
+    Recommendation(
+        id="rec-ecs-001",
+        resource_type="ecs_service",
+        resource_name="checkout-svc",
+        resource_arn="arn:aws:ecs:us-east-1:123456789012:service/prod-cluster/checkout-svc",
+        region="us-east-1",
+        current={"cpu": 1024, "memory": 2048},
+        recommended={"cpu": 512, "memory": 1024},
+        monthly_savings_usd=96.30,
+        metrics={
+            "cpu_p95_percent": 9.5,
+            "memory_p95_percent": 31.0,
+            "lookback_days": 14,
+        },
+        finding="Overprovisioned",
+    ),
+    Recommendation(
+        id="rec-lambda-001",
+        resource_type="lambda_function",
+        resource_name="image-resizer",
+        resource_arn="arn:aws:lambda:us-east-1:123456789012:function:image-resizer",
+        region="us-east-1",
+        current={"memory_size": 1024},
+        recommended={"memory_size": 512},
+        monthly_savings_usd=34.75,
+        metrics={
+            "memory_utilization_p95_percent": 28.0,
+            "duration_p95_ms": 840,
+            "lookback_days": 14,
+        },
+        finding="Overprovisioned",
+    ),
+    Recommendation(
+        id="rec-k8s-001",
+        resource_type="k8s_workload",
+        resource_name="payments-api",
+        resource_arn="k8s://prod-cluster/default/deployment/payments-api",
+        region="us-east-1",
+        current={
+            "resources.requests.cpu": "500m",
+            "resources.requests.memory": "1Gi",
+            "resources.limits.cpu": "1000m",
+            "resources.limits.memory": "2Gi",
+            "autoscaling.maxReplicas": 20,
+        },
+        recommended={
+            "resources.requests.cpu": "200m",
+            "resources.requests.memory": "512Mi",
+            "resources.limits.cpu": "500m",
+            "resources.limits.memory": "1Gi",
+            "autoscaling.maxReplicas": 12,
+        },
+        monthly_savings_usd=210.40,
+        metrics={
+            "cpu_p95_millicores": 112,
+            "memory_p95_mib": 340,
+            "hpa_max_replicas_reached": 9,
+            "lookback_days": 14,
+        },
+        finding="Overprovisioned",
     ),
     Recommendation(
         id="rec-rds-002",
@@ -234,6 +295,131 @@ def _fetch_eks_from_aws(region: Optional[str]) -> list[Recommendation]:
     return recs
 
 
+def _fetch_ecs_from_aws(region: Optional[str]) -> list[Recommendation]:
+    import boto3
+
+    client = boto3.client("compute-optimizer", region_name=region or "us-east-1")
+    recs: list[Recommendation] = []
+    kwargs: dict[str, Any] = {}
+    while True:
+        resp = client.get_ecs_service_recommendations(**kwargs)
+        for r in resp.get("ecsServiceRecommendations", []):
+            if "Overprovisioned" not in (r.get("finding") or ""):
+                continue
+            options = r.get("serviceRecommendationOptions") or []
+            if not options:
+                continue
+            best = options[0]
+            cur = r.get("currentServiceConfiguration", {})
+            savings = (
+                (best.get("savingsOpportunity") or {})
+                .get("estimatedMonthlySavings", {})
+                .get("value", 0.0)
+            )
+            metrics = {
+                m["name"].lower(): m.get("value")
+                for m in r.get("utilizationMetrics", [])
+                if "name" in m
+            }
+            metrics["lookback_days"] = int(r.get("lookbackPeriodInDays", 14))
+            arn = r.get("serviceArn", "")
+            name = arn.rsplit("/", 1)[-1] if arn else ""
+            recs.append(
+                Recommendation(
+                    id=f"rec-ecs-{name}",
+                    resource_type="ecs_service",
+                    resource_name=name,
+                    resource_arn=arn,
+                    region=region or "",
+                    current={"cpu": cur.get("cpu"), "memory": cur.get("memory")},
+                    recommended={"cpu": best.get("cpu"), "memory": best.get("memory")},
+                    monthly_savings_usd=float(savings or 0.0),
+                    metrics=metrics,
+                    finding=r.get("finding", ""),
+                )
+            )
+        token = resp.get("nextToken")
+        if not token:
+            break
+        kwargs = {"nextToken": token}
+    return recs
+
+
+def _fetch_lambda_from_aws(region: Optional[str]) -> list[Recommendation]:
+    import boto3
+
+    client = boto3.client("compute-optimizer", region_name=region or "us-east-1")
+    recs: list[Recommendation] = []
+    kwargs: dict[str, Any] = {}
+    while True:
+        resp = client.get_lambda_function_recommendations(**kwargs)
+        for r in resp.get("lambdaFunctionRecommendations", []):
+            if "Overprovisioned" not in (r.get("finding") or ""):
+                continue
+            options = r.get("memorySizeRecommendationOptions") or []
+            if not options:
+                continue
+            best = options[0]
+            savings = (
+                (best.get("savingsOpportunity") or {})
+                .get("estimatedMonthlySavings", {})
+                .get("value", 0.0)
+            )
+            metrics = {
+                m["name"].lower(): m.get("value")
+                for m in r.get("utilizationMetrics", [])
+                if "name" in m
+            }
+            metrics["lookback_days"] = int(r.get("lookbackPeriodInDays", 14))
+            arn = r.get("functionArn", "")
+            name = arn.split(":function:")[-1].split(":")[0] if arn else ""
+            recs.append(
+                Recommendation(
+                    id=f"rec-lambda-{name}",
+                    resource_type="lambda_function",
+                    resource_name=name,
+                    resource_arn=arn,
+                    region=region or "",
+                    current={"memory_size": r.get("currentMemorySize")},
+                    recommended={"memory_size": best.get("memorySize")},
+                    monthly_savings_usd=float(savings or 0.0),
+                    metrics=metrics,
+                    finding=r.get("finding", ""),
+                )
+            )
+        token = resp.get("nextToken")
+        if not token:
+            break
+        kwargs = {"nextToken": token}
+    return recs
+
+
+def _load_k8s_recs_from_file() -> list[Recommendation]:
+    """K8s pod/HPA rightsizing has no Compute Optimizer API. Users can export
+    recommendations from VPA, Goldilocks, Kubecost, or Prometheus into a JSON
+    file and point FINOPS_K8S_RECS_FILE at it. Schema matches Recommendation
+    fields; resource_type is forced to \"k8s_workload\".
+    """
+    import json
+
+    path = os.environ.get("FINOPS_K8S_RECS_FILE")
+    if not path or not os.path.exists(path):
+        return []
+    with open(path, encoding="utf-8") as f:
+        raw = json.load(f)
+    recs = []
+    for item in raw:
+        item["resource_type"] = "k8s_workload"
+        recs.append(Recommendation(**{
+            k: item.get(k, {} if k in ("current", "recommended", "metrics") else "")
+            for k in (
+                "id", "resource_type", "resource_name", "resource_arn", "region",
+                "current", "recommended", "monthly_savings_usd", "metrics", "finding",
+            )
+        }))
+    return recs
+
+
 # --------------------------------------------------------------------------
 # Public API
 # --------------------------------------------------------------------------
@@ -252,7 +438,10 @@ def get_recommendations(
     threshold = (
         min_monthly_savings if min_monthly_savings is not None else SIGNIFICANT_SAVINGS_USD
     )
-    wanted = set(resource_types or ["eks_nodegroup", "rds_instance"])
+    wanted = set(
+        resource_types
+        or ["eks_nodegroup", "rds_instance", "ecs_service", "lambda_function", "k8s_workload"]
+    )
 
     source = "mock"
     aws_error: Optional[str] = None
@@ -264,6 +453,12 @@ def get_recommendations(
                 raw += _fetch_rds_from_aws(region)
             if "eks_nodegroup" in wanted:
                 raw += _fetch_eks_from_aws(region)
+            if "ecs_service" in wanted:
+                raw += _fetch_ecs_from_aws(region)
+            if "lambda_function" in wanted:
+                raw += _fetch_lambda_from_aws(region)
+            if "k8s_workload" in wanted:
+                raw += _load_k8s_recs_from_file()
             source = "aws"
         except Exception as e:
             if mode == "aws":
