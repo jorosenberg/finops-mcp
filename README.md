@@ -1,17 +1,19 @@
 # finops-mcp
 
-An [MCP](https://modelcontextprotocol.io) server for automated AWS cost optimization. It ingests AWS Compute Optimizer over-provisioning recommendations (EKS nodegroups, RDS instances), maps them to your local Terraform/OpenTofu codebase, applies minimal safe rightsizing patches, verifies them locally, and drafts Git branches with structured PR bodies.
+An [MCP](https://modelcontextprotocol.io) server for automated AWS cost optimization. It ingests AWS Compute Optimizer over-provisioning recommendations (EKS nodegroups, RDS instances, ECS services, Lambda functions) plus Kubernetes pod/HPA rightsizing, maps them to your local Terraform/OpenTofu codebase or Helm values.yaml, applies minimal safe rightsizing patches, verifies them locally, and drafts Git branches with structured PR bodies.
 
 **It never applies changes to your cloud environment directly.** All output is code changes on local branches for human review.
+
+Supported resource types: `eks_nodegroup`, `rds_instance`, `ecs_service`, `lambda_function`, `k8s_workload` (pod requests/limits + HPA replicas via Helm values.yaml; recommendations from a VPA/Goldilocks/Kubecost JSON export via `FINOPS_K8S_RECS_FILE`).
 
 ## How it works
 
 ```
 AWS Compute Optimizer ──▶ 1. Telemetry ingestion (filter significant, safe recommendations)
-                          2. Codebase mapping    (find the resource in *.tf / *.tfvars,
-                                                  trace variable indirection to its source)
+(+ K8s recs export)       2. Codebase mapping    (find the resource in *.tf / *.tfvars /
+                                                  values.yaml, trace variable indirection)
                           3. Safe patching       (minimal diff, allowlisted attributes only)
-                          4. Local verification  (terraform validate/plan or HCL lint,
+                          4. Local verification  (terraform validate/plan or HCL/YAML lint,
                                                   plus a diff-scope drift guard)
                           5. PR drafting         (isolated finops/* branch + structured PR body)
 ```
@@ -21,7 +23,7 @@ AWS Compute Optimizer ──▶ 1. Telemetry ingestion (filter significant, safe
 | Tool | What it does |
 |---|---|
 | `get_cost_recommendations` | Fetch over-provisioning recommendations from Compute Optimizer (mock fallback without credentials) |
-| `map_resource_to_code` | Locate a recommended resource's declaration in local IaC, tracing `var.x` to tfvars or variable defaults |
+| `map_resource_to_code` | Locate a recommended resource's declaration in local IaC, tracing `var.x` to tfvars or variable defaults; values.yaml for K8s workloads |
 | `draft_optimization` | Patch one recommendation, verify, generate PR body, create a `finops/*` branch |
 | `run_finops_cycle` | Full loop over all recommendations; `mode="interactive"` or `mode="scheduled"` (writes `finops_run_log.json`) |
 | `verify_repository` | Standalone lint / `terraform validate` / diff-scope check of a repo |
@@ -64,6 +66,7 @@ Claude Code: `claude mcp add finops-optimizer -- python -m finops_mcp.server`
 | `FINOPS_MODE` | `auto` (real AWS if credentials work, else mock), `aws`, or `mock` | `auto` |
 | `FINOPS_REPO_PATH` | Default Terraform repo when tools omit `repo_path` | cwd |
 | `FINOPS_MIN_MONTHLY_SAVINGS` | Significance threshold in USD | `20` |
+| `FINOPS_K8S_RECS_FILE` | Optional JSON export of K8s workload recommendations (VPA/Goldilocks/Kubecost) | — |
 | `AWS_REGION` | Region queried for recommendations | `us-east-1` |
 | `FINOPS_PUSH` | Scheduler only: `true` to push branches to origin | `false` |
 
@@ -75,7 +78,7 @@ Claude Code: `claude mcp add finops-optimizer -- python -m finops_mcp.server`
 
 ## Safety guarantees
 
-- Only allowlisted rightsizing attributes are ever patched: `instance_type(s)`, `instance_class`, `min/max/desired_size`, `allocated_storage`
+- Only allowlisted rightsizing attributes are ever patched — Terraform: `instance_type(s)`, `instance_class`, `min/max/desired_size`, `allocated_storage`, `cpu`, `memory`, `memory_size`, `desired_count`; YAML: `cpu`, `memory`, `minReplicas`, `maxReplicas`, `replicas`, `replicaCount`
 - Secret-bearing lines (password/token/key), VPC/subnet/security-group blocks, and `backend` state configuration are never modified — enforced at patch time and re-checked by a diff-scope guard over `git diff`
 - Resources whose lifecycle is managed externally (e.g. Karpenter nodepools) are detected and skipped
 - Failed verification automatically rolls back the working tree
@@ -93,14 +96,14 @@ FINOPS_REPO_PATH=/path/to/repo python finops_scheduler.py
 
 ## Try it without AWS
 
-`sample-infra/` is a demo Terraform repo (EKS nodegroup + RDS instance, tfvars indirection, protected networking blocks, a sensitive password line) that matches the built-in mock recommendations:
+`sample-infra/` is a demo repo (EKS nodegroup, RDS instance, ECS service, Lambda function, and a Helm chart for a K8s workload — with tfvars indirection, protected networking blocks, and sensitive lines) that matches the built-in mock recommendations:
 
 ```bash
 cd sample-infra && git init -b main && git add -A && git commit -m initial && cd ..
 FINOPS_MODE=mock python -c "from finops_mcp import server; print(server.run_finops_cycle(repo_path='sample-infra'))"
 ```
 
-Expected result: two isolated branches — `finops/rightsize-app-workers-<date>` (m5.xlarge→m5.large via tfvars + scaling 3/10/6→2/8/4) and `finops/rightsize-orders-db-<date>` (db.r5.2xlarge→db.r5.xlarge) — each with a PR body under `.finops/`.
+Expected result: five isolated branches — EKS (m5.xlarge→m5.large via tfvars + scaling 3/10/6→2/8/4), RDS (db.r5.2xlarge→db.r5.xlarge), ECS (cpu 1024→512, memory 2048→1024), Lambda (1024MB→512MB), and K8s (pod requests/limits + HPA maxReplicas in values.yaml) — each with a PR body under `.finops/`.
 
 ## Example PR body
 

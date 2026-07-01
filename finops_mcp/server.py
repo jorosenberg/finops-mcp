@@ -23,10 +23,12 @@ from . import gitops, mapper, patcher, runlog, telemetry, verify as verifier
 mcp = FastMCP(
     "finops-optimizer",
     instructions=(
-        "Automated FinOps rightsizing for EKS nodegroups and RDS instances. "
-        "Ingests AWS Compute Optimizer recommendations, maps them to local "
-        "Terraform/OpenTofu code, applies minimal safe patches, verifies them, "
-        "and drafts PR branches. Never applies changes to the cloud directly."
+        "Automated FinOps rightsizing for EKS nodegroups, RDS instances, ECS "
+        "services, Lambda functions, and K8s workloads (pod/HPA limits via "
+        "Helm values.yaml). Ingests AWS Compute Optimizer recommendations, "
+        "maps them to local Terraform/OpenTofu or Helm code, applies minimal "
+        "safe patches, verifies them, and drafts PR branches. Never applies "
+        "changes to the cloud directly."
     ),
 )
 
@@ -41,11 +43,13 @@ def get_cost_recommendations(
     region: Optional[str] = None,
     min_monthly_savings: Optional[float] = None,
 ) -> str:
-    """Step 1 — Fetch over-provisioning recommendations for EKS nodegroups and
-    RDS instances from AWS Compute Optimizer (falls back to mock data when no
-    AWS credentials are available; controlled by FINOPS_MODE=aws|mock|auto).
+    """Step 1 — Fetch over-provisioning recommendations from AWS Compute
+    Optimizer (falls back to mock data when no AWS credentials are available;
+    controlled by FINOPS_MODE=aws|mock|auto).
 
-    resource_types: subset of ["eks_nodegroup", "rds_instance"]; default both.
+    resource_types: subset of ["eks_nodegroup", "rds_instance", "ecs_service",
+      "lambda_function", "k8s_workload"]; default all. K8s workload recs come
+      from FINOPS_K8S_RECS_FILE (VPA/Goldilocks/Kubecost export) or mock data.
     min_monthly_savings: significance threshold in USD (default $20).
     """
     result = telemetry.get_recommendations(
@@ -59,8 +63,9 @@ def get_cost_recommendations(
 @mcp.tool()
 def map_resource_to_code(recommendation_id: str, repo_path: Optional[str] = None) -> str:
     """Step 2 — Locate where the recommended resource is declared in the local
-    Terraform/OpenTofu codebase (*.tf, *.tfvars). Traces variable indirection
-    to its true source (tfvars assignment or variable default)."""
+    codebase: Terraform/OpenTofu (*.tf, *.tfvars) for AWS resources, or Helm
+    values.yaml for K8s workloads. Traces variable indirection to its true
+    source (tfvars assignment or variable default)."""
     repo = os.path.abspath(repo_path or _default_repo())
     rec = telemetry.get_recommendation_by_id(recommendation_id)
     if not rec:
@@ -77,9 +82,9 @@ def draft_optimization(
     run_plan: bool = False,
 ) -> str:
     """Steps 3–4 — For one recommendation: apply the minimal rightsizing patch,
-    run local verification (terraform validate/plan when available, HCL lint
-    otherwise, plus a diff-scope drift guard), and generate the structured PR
-    body. Optionally commits to a new finops/* branch. Never applies to cloud.
+    run local verification (terraform validate/plan when available, HCL/YAML
+    lint otherwise, plus a diff-scope drift guard), and generate the structured
+    PR body. Optionally commits to a new finops/* branch. Never applies to cloud.
     """
     repo = os.path.abspath(repo_path or _default_repo())
     rec = telemetry.get_recommendation_by_id(recommendation_id)
@@ -197,11 +202,14 @@ def run_finops_cycle(
 
 @mcp.tool()
 def verify_repository(repo_path: Optional[str] = None, run_plan: bool = False) -> str:
-    """Standalone verification: HCL-lint all *.tf/*.tfvars files in the repo,
-    run terraform validate/plan when the binary is available, and report the
-    current git diff scope."""
+    """Standalone verification: lint all *.tf/*.tfvars/values.yaml files in the
+    repo, run terraform validate/plan when the binary is available, and report
+    the current git diff scope."""
     repo = os.path.abspath(repo_path or _default_repo())
-    files = [f for f in mapper._iter_files(repo) if f.endswith((".tf", ".tfvars"))]
+    files = [
+        f for f in mapper._iter_files(repo)
+        if f.endswith((".tf", ".tfvars")) or os.path.basename(f) in mapper.HELM_FILENAMES
+    ]
     return json.dumps(verifier.verify(repo, files, plan=run_plan), indent=2, default=str)
 
 
