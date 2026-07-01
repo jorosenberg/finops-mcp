@@ -1,0 +1,4 @@
+.finops/
+finops_run_log.json
+.terraform/
+*.tfstate*
