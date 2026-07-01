@@ -1,0 +1,6 @@
+__pycache__/
+*.egg-info/
+.venv/
+finops_pipeline.log
+finops_run_log.json
+.finops/
