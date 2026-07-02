@@ -33,7 +33,7 @@ class Recommendation:
 
 
 # --------------------------------------------------------------------------
-# Mock data — deterministic, mirrors real Compute Optimizer response shapes
+# Mock data - deterministic, mirrors real Compute Optimizer response shapes
 # --------------------------------------------------------------------------
 
 MOCK_RECOMMENDATIONS: list[Recommendation] = [
@@ -82,7 +82,7 @@ MOCK_RECOMMENDATIONS: list[Recommendation] = [
         monthly_savings_usd=155.0,
         metrics={"cpu_p95_percent": 14.0, "lookback_days": 14},
         finding="Overprovisioned",
-        externally_managed=True,  # lifecycle owned by Karpenter — must be skipped
+        externally_managed=True,  # lifecycle owned by Karpenter - must be skipped
     ),
     Recommendation(
         id="rec-ecs-001",
@@ -153,7 +153,7 @@ MOCK_RECOMMENDATIONS: list[Recommendation] = [
         region="us-east-1",
         current={"instance_class": "db.t3.medium", "allocated_storage_gb": 100},
         recommended={"instance_class": "db.t3.small", "allocated_storage_gb": 100},
-        monthly_savings_usd=8.40,  # below significance threshold — filtered out
+        monthly_savings_usd=8.40,  # below significance threshold - filtered out
         metrics={"cpu_p95_percent": 18.0, "lookback_days": 14},
         finding="Overprovisioned",
     ),
@@ -477,7 +477,7 @@ def get_recommendations(
         if rec.monthly_savings_usd < threshold:
             reason = f"monthly savings ${rec.monthly_savings_usd:.2f} below threshold ${threshold:.2f}"
         elif rec.externally_managed and not include_externally_managed:
-            reason = "lifecycle managed externally (e.g. Karpenter) — static patch unsafe"
+            reason = "lifecycle managed externally (e.g. Karpenter) - static patch unsafe"
         if reason:
             dropped.append({**rec.to_dict(), "skip_reason": reason})
         else:

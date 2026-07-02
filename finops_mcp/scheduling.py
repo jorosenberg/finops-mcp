@@ -85,7 +85,7 @@ def _profile_to_schedule(active: list[bool]) -> Optional[dict[str, Any]]:
     if idle_hours < MIN_IDLE_HOURS_WEEK:
         return None
     if idle_hours >= 166:
-        # effectively never used — that's a decommission candidate, not a schedule
+        # effectively never used - that's a decommission candidate, not a schedule
         return {"kind": "always_idle", "idle_hours_per_week": idle_hours}
 
     day_spans: dict[str, Optional[tuple[int, int]]] = {}
@@ -98,7 +98,7 @@ def _profile_to_schedule(active: list[bool]) -> Optional[dict[str, Any]]:
             spike_hours += sum(1 for h in hours if not (span[0] <= h < span[1]))
 
     # A day whose only activity is a single hour is itself a spike (cron/backup),
-    # not a usage pattern — drop it from window aggregation when any real
+    # not a usage pattern - drop it from window aggregation when any real
     # (multi-hour) activity block exists elsewhere in the week.
     singles = [day for day, s in day_spans.items() if s and s[1] - s[0] < 2]
     has_real_block = any(
@@ -131,7 +131,7 @@ def _profile_to_schedule(active: list[bool]) -> Optional[dict[str, Any]]:
 
     off_hours = 168 - on_hours
     if off_hours < MIN_IDLE_HOURS_WEEK:
-        # the window barely turns anything off — activity too dispersed to
+        # the window barely turns anything off - activity too dispersed to
         # schedule meaningfully; don't recommend
         return {"kind": "dispersed", "idle_hours_per_week": idle_hours,
                 "off_hours_per_week": off_hours}
@@ -173,7 +173,7 @@ def _build_recommendation(
         metrics["activity_spikes_outside_window_hours_per_week"] = schedule["spike_hours_outside_window"]
         metrics["spike_warning"] = (
             "isolated activity detected outside the recommended window (e.g. "
-            "crons/backups) — the instance would be STOPPED during those hours; review before merging"
+            "crons/backups) - the instance would be STOPPED during those hours; review before merging"
         )
     if skip_note:
         metrics["skip_note"] = skip_note
@@ -197,7 +197,7 @@ def _build_recommendation(
 
 
 # --------------------------------------------------------------------------
-# Mock profiles — deterministic synthetic workloads
+# Mock profiles - deterministic synthetic workloads
 # --------------------------------------------------------------------------
 
 def _mock_profile(active_weekday: tuple[int, int], weekend: bool) -> list[bool]:
@@ -234,7 +234,7 @@ def _mock_schedule_recommendations() -> list[Recommendation]:
          "lookback_days": 14},
     ))
 
-    # ci-worker: idle nights but in an ASG — must be skipped
+    # ci-worker: idle nights but in an ASG - must be skipped
     sched = _profile_to_schedule(_mock_profile((8, 18), weekend=False))
     recs.append(_build_recommendation(
         "ec2", "ci-worker",
@@ -369,7 +369,7 @@ def _analyze_rds(region: Optional[str], lookback_days: int) -> list[Recommendati
                 continue
             reason = ""
             if unschedulable:
-                reason = "Multi-AZ / replica / Aurora member — stop-start scheduling unsafe"
+                reason = "Multi-AZ / replica / Aurora member - stop-start scheduling unsafe"
             recs.append(_build_recommendation(
                 "rds", ident,
                 db.get("DBInstanceArn", ""),
