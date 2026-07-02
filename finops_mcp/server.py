@@ -262,7 +262,8 @@ def draft_schedule(
     result: dict[str, Any] = {"recommendation_id": recommendation_id, "resource": rec["resource_name"]}
 
     if schedule_override:
-        if not bootstrap.parse_schedule_name(schedule_override):
+        spec = bootstrap.parse_schedule_name(schedule_override)
+        if not spec:
             return json.dumps({
                 "error": f"invalid schedule_override '{schedule_override}' "
                          "(expected mon-fri-HH-HH, daily-HH-HH, or sat-sun-HH-HH)"
@@ -270,6 +271,12 @@ def draft_schedule(
         rec["recommended"]["schedule"] = schedule_override
         rec["recommended"]["schedule_description"] = f"user-preferred window {schedule_override}"
         result["schedule_override"] = schedule_override
+        # recompute savings from the chosen window's actual off-hours
+        price = rec.get("metrics", {}).get("assumed_hourly_price_usd")
+        if price:
+            off = 168 - len(spec["days"]) * (spec["stop"] - spec["start"])
+            rec["monthly_savings_usd"] = round(off * 4.345 * float(price), 2)
+            rec["metrics"]["scheduled_off_hours_per_week"] = off
 
     detection = bootstrap.check_scheduler_deployed(rec.get("region"))
     result["scheduler_deployed"] = detection
