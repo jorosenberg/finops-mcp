@@ -62,7 +62,7 @@ def run_terraform_check(repo_path: str, plan: bool = False) -> dict[str, Any]:
         return {"available": False, "note": "terraform/tofu binary not found; HCL lint used instead"}
 
     # Bounded so a slow `terraform init` (provider downloads) can't stall the
-    # MCP call — on timeout we fall back to HCL lint instead of failing.
+    # MCP call - on timeout we fall back to HCL lint instead of failing.
     step_timeout = int(os.environ.get("FINOPS_TF_TIMEOUT", "45"))
 
     steps = {}
@@ -80,7 +80,7 @@ def run_terraform_check(repo_path: str, plan: bool = False) -> dict[str, Any]:
                 "available": False,
                 "note": (
                     f"`{binary} {args[0]}` exceeded {step_timeout}s "
-                    "(likely provider downloads) — skipped; HCL lint used instead. "
+                    "(likely provider downloads) - skipped; HCL lint used instead. "
                     "Run `terraform init` in the repo once, or raise FINOPS_TF_TIMEOUT."
                 ),
                 "steps": steps,

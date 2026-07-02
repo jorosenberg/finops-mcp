@@ -157,7 +157,7 @@ def upsert_schedule_tag(
     tag_value: str,
 ) -> dict[str, Any]:
     """Insert (or update) `Schedule = "<value>"` inside the `tags` map of one
-    resource block. Additive, minimal diff. Requires an existing tags map —
+    resource block. Additive, minimal diff. Requires an existing tags map -
     creating whole new blocks is out of scope for safe automation.
     """
     content = open(file_path, encoding="utf-8").read()
