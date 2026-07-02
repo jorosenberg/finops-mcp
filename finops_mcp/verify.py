@@ -25,7 +25,9 @@ def _tf_binary() -> str | None:
 
 
 def lint_hcl_files(files: list[str]) -> dict[str, Any]:
-    """Parse-lint modified files: HCL2 for *.tf/*.tfvars, YAML for *.yaml/yml."""
+    """Parse-lint modified files: HCL2 for *.tf/*.tfvars, YAML for *.yaml/yml,
+    ast for generated *.py (Lambda sources)."""
+    import ast
     import hcl2
     import yaml
 
@@ -36,6 +38,9 @@ def lint_hcl_files(files: list[str]) -> dict[str, Any]:
             if path.endswith((".yaml", ".yml")):
                 with open(path, encoding="utf-8") as f:
                     yaml.safe_load(f)
+            elif path.endswith(".py"):
+                with open(path, encoding="utf-8") as f:
+                    ast.parse(f.read())
             else:
                 with open(path, encoding="utf-8") as f:
                     hcl2.load(f)
