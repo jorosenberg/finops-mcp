@@ -13,7 +13,8 @@ Safety exclusions (never scheduled):
 - anything tagged Environment=prod/production or Schedule=<already set>
 
 Savings are estimates from a static on-demand price table (documented
-approximation; exact prices vary by region/OS).
+approximation; exact prices vary by region/OS) and are computed from the
+hours the recommended window actually turns the instance off.
 """
 
 from __future__ import annotations
@@ -27,6 +28,14 @@ MIN_IDLE_HOURS_WEEK = float(os.environ.get("FINOPS_MIN_IDLE_HOURS_WEEK", "40"))
 IDLE_CONFIDENCE = float(os.environ.get("FINOPS_IDLE_CONFIDENCE", "0.9"))
 EC2_IDLE_CPU_PERCENT = float(os.environ.get("FINOPS_EC2_IDLE_CPU", "3.0"))
 WEEKS_PER_MONTH = 4.345
+
+
+def _boto_config():
+    """Bounded timeouts/retries so a slow AWS API can't stall an MCP call."""
+    from botocore.config import Config
+
+    return Config(connect_timeout=5, read_timeout=15, retries={"max_attempts": 2})
+
 
 DAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
 
@@ -47,9 +56,31 @@ DEFAULT_PRICE = 0.10
 # Profile -> schedule derivation
 # --------------------------------------------------------------------------
 
+def _longest_active_run(hours: list[int]) -> Optional[tuple[int, int]]:
+    """Longest contiguous run of active hours in a day -> (start, stop)."""
+    if not hours:
+        return None
+    runs = []
+    start = prev = hours[0]
+    for h in hours[1:]:
+        if h == prev + 1:
+            prev = h
+        else:
+            runs.append((start, prev))
+            start = prev = h
+    runs.append((start, prev))
+    s, e = max(runs, key=lambda r: r[1] - r[0])
+    return (s, e + 1)
+
+
 def _profile_to_schedule(active: list[bool]) -> Optional[dict[str, Any]]:
     """active: 168 bools (Mon 00:00 .. Sun 23:00). Returns a schedule spec or
-    None when the instance is essentially always active / always idle."""
+    None when the instance is essentially always active / always idle.
+
+    Each day's window is the LONGEST CONTIGUOUS active run, not the min-max
+    span: isolated activity spikes (midnight crons, backups, health checks)
+    are excluded from the window but counted in spike_hours so a reviewer can
+    judge whether stopping the instance during them is safe."""
     idle_hours = active.count(False)
     if idle_hours < MIN_IDLE_HOURS_WEEK:
         return None
@@ -57,11 +88,27 @@ def _profile_to_schedule(active: list[bool]) -> Optional[dict[str, Any]]:
         # effectively never used — that's a decommission candidate, not a schedule
         return {"kind": "always_idle", "idle_hours_per_week": idle_hours}
 
-    # Per-day active spans
     day_spans: dict[str, Optional[tuple[int, int]]] = {}
+    spike_hours = 0
     for d in range(7):
         hours = [h for h in range(24) if active[d * 24 + h]]
-        day_spans[DAYS[d]] = (min(hours), max(hours) + 1) if hours else None
+        span = _longest_active_run(hours)
+        day_spans[DAYS[d]] = span
+        if span:
+            spike_hours += sum(1 for h in hours if not (span[0] <= h < span[1]))
+
+    # A day whose only activity is a single hour is itself a spike (cron/backup),
+    # not a usage pattern — drop it from window aggregation when any real
+    # (multi-hour) activity block exists elsewhere in the week.
+    singles = [day for day, s in day_spans.items() if s and s[1] - s[0] < 2]
+    has_real_block = any(
+        s for day, s in day_spans.items() if day not in singles and s
+    )
+    if has_real_block:
+        for day in singles:
+            s = day_spans[day]
+            spike_hours += s[1] - s[0]
+            day_spans[day] = None
 
     weekday_spans = [s for day, s in day_spans.items() if day in DAYS[:5] and s]
     weekend_active = any(day_spans[d] for d in DAYS[5:])
@@ -71,17 +118,31 @@ def _profile_to_schedule(active: list[bool]) -> Optional[dict[str, Any]]:
         stop = max(s[1] for s in weekday_spans)
         name = f"mon-fri-{start:02d}-{stop:02d}"
         description = f"running Mon-Fri {start:02d}:00-{stop:02d}:00, stopped nights and weekends"
+        on_hours = 5 * (stop - start)
     else:
-        start = min(s[0] for s in day_spans.values() if s)
-        stop = max(s[1] for s in day_spans.values() if s)
+        spans = [s for s in day_spans.values() if s]
+        if not spans:
+            return {"kind": "always_idle", "idle_hours_per_week": idle_hours}
+        start = min(s[0] for s in spans)
+        stop = max(s[1] for s in spans)
         name = f"daily-{start:02d}-{stop:02d}"
         description = f"running daily {start:02d}:00-{stop:02d}:00, stopped overnight"
+        on_hours = 7 * (stop - start)
+
+    off_hours = 168 - on_hours
+    if off_hours < MIN_IDLE_HOURS_WEEK:
+        # the window barely turns anything off — activity too dispersed to
+        # schedule meaningfully; don't recommend
+        return {"kind": "dispersed", "idle_hours_per_week": idle_hours,
+                "off_hours_per_week": off_hours}
 
     return {
         "kind": "window",
         "name": name,
         "description": description,
         "idle_hours_per_week": idle_hours,
+        "off_hours_per_week": off_hours,
+        "spike_hours_outside_window": spike_hours,
     }
 
 
@@ -96,15 +157,24 @@ def _build_recommendation(
     externally_managed: bool = False,
     skip_note: str = "",
 ) -> Recommendation:
-    idle = schedule["idle_hours_per_week"]
+    # Savings come from the hours the WINDOW actually turns the instance off,
+    # not from raw observed idle hours (the window may keep some idle hours on).
+    off = schedule.get("off_hours_per_week", schedule["idle_hours_per_week"])
     price = PRICE_PER_HOUR.get(instance_type, DEFAULT_PRICE)
-    savings = round(idle * WEEKS_PER_MONTH * price, 2)
+    savings = round(off * WEEKS_PER_MONTH * price, 2)
     metrics = {
         **metrics,
-        "idle_hours_per_week": idle,
+        "observed_idle_hours_per_week": schedule["idle_hours_per_week"],
+        "scheduled_off_hours_per_week": off,
         "assumed_hourly_price_usd": price,
         "note": "compute-only savings; EBS/RDS storage still billed while stopped",
     }
+    if schedule.get("spike_hours_outside_window"):
+        metrics["activity_spikes_outside_window_hours_per_week"] = schedule["spike_hours_outside_window"]
+        metrics["spike_warning"] = (
+            "isolated activity detected outside the recommended window (e.g. "
+            "crons/backups) — the instance would be STOPPED during those hours; review before merging"
+        )
     if skip_note:
         metrics["skip_note"] = skip_note
     return Recommendation(
@@ -232,8 +302,8 @@ def _hourly_idle_profile(
 def _analyze_ec2(region: Optional[str], lookback_days: int) -> list[Recommendation]:
     import boto3
 
-    ec2 = boto3.client("ec2", region_name=region or "us-east-1")
-    cw = boto3.client("cloudwatch", region_name=region or "us-east-1")
+    ec2 = boto3.client("ec2", region_name=region or "us-east-1", config=_boto_config())
+    cw = boto3.client("cloudwatch", region_name=region or "us-east-1", config=_boto_config())
     recs: list[Recommendation] = []
 
     paginator = ec2.get_paginator("describe_instances")
@@ -271,8 +341,8 @@ def _analyze_ec2(region: Optional[str], lookback_days: int) -> list[Recommendati
 def _analyze_rds(region: Optional[str], lookback_days: int) -> list[Recommendation]:
     import boto3
 
-    rds = boto3.client("rds", region_name=region or "us-east-1")
-    cw = boto3.client("cloudwatch", region_name=region or "us-east-1")
+    rds = boto3.client("rds", region_name=region or "us-east-1", config=_boto_config())
+    cw = boto3.client("cloudwatch", region_name=region or "us-east-1", config=_boto_config())
     recs: list[Recommendation] = []
 
     paginator = rds.get_paginator("describe_db_instances")
