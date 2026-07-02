@@ -6,6 +6,8 @@ Tools:
   draft_optimization         — Steps 3–4 for one recommendation: patch + verify + PR body
   run_finops_cycle           — full loop over all recommendations (Trigger A/B)
   verify_repository          — standalone verification of a repo's current state
+  analyze_usage_windows      — detect recurring idle windows on EC2/RDS
+  draft_schedule             — upsert Schedule tag for a schedule recommendation
 
 Run: `python -m finops_mcp.server` (stdio) or `finops-mcp` after pip install.
 """
@@ -18,17 +20,17 @@ from typing import Any, Optional
 
 from mcp.server.fastmcp import FastMCP
 
-from . import gitops, mapper, patcher, runlog, telemetry, verify as verifier
+from . import gitops, mapper, patcher, runlog, scheduling, telemetry, verify as verifier
 
 mcp = FastMCP(
     "finops-optimizer",
     instructions=(
-        "Automated FinOps rightsizing for EKS nodegroups, RDS instances, ECS "
-        "services, Lambda functions, and K8s workloads (pod/HPA limits via "
-        "Helm values.yaml). Ingests AWS Compute Optimizer recommendations, "
-        "maps them to local Terraform/OpenTofu or Helm code, applies minimal "
-        "safe patches, verifies them, and drafts PR branches. Never applies "
-        "changes to the cloud directly."
+        "Automated FinOps rightsizing and instance scheduling for EKS "
+        "nodegroups, RDS instances, ECS services, Lambda functions, K8s "
+        "workloads, and EC2. Ingests AWS Compute Optimizer recommendations "
+        "and CloudWatch usage-timing analysis, maps them to local Terraform/"
+        "OpenTofu or Helm code, applies minimal safe patches, verifies them, "
+        "and drafts PR branches. Never applies changes to the cloud directly."
     ),
 )
 
@@ -211,6 +213,101 @@ def verify_repository(repo_path: Optional[str] = None, run_plan: bool = False) -
         if f.endswith((".tf", ".tfvars")) or os.path.basename(f) in mapper.HELM_FILENAMES
     ]
     return json.dumps(verifier.verify(repo, files, plan=run_plan), indent=2, default=str)
+
+
+@mcp.tool()
+def analyze_usage_windows(
+    region: Optional[str] = None,
+    lookback_days: int = 14,
+    min_monthly_savings: Optional[float] = None,
+) -> str:
+    """Scheduling Step 1 — Analyze EC2/RDS usage timing (CloudWatch hourly
+    metrics folded into an hour-of-week profile; mock profiles without AWS
+    credentials) and recommend start/stop schedules for resources with
+    recurring idle windows (e.g. "running Mon-Fri 07-20, stopped nights and
+    weekends"). Automatically excludes ASG members, RDS Multi-AZ/replicas/
+    Aurora, prod-tagged, and already-scheduled resources. Savings estimates
+    are compute-only (storage still bills while stopped)."""
+    result = scheduling.get_schedule_recommendations(
+        region=region,
+        lookback_days=lookback_days,
+        min_monthly_savings=min_monthly_savings,
+    )
+    return json.dumps(result, indent=2, default=str)
+
+
+@mcp.tool()
+def draft_schedule(
+    recommendation_id: str,
+    repo_path: Optional[str] = None,
+    create_branch: bool = True,
+    push: bool = False,
+) -> str:
+    """Scheduling Steps 2–4 — For one schedule recommendation: locate the
+    aws_instance / aws_db_instance block in Terraform, upsert a
+    `Schedule = "<window>"` tag (AWS Instance Scheduler-compatible), verify,
+    and draft the PR branch. Requires a tag-driven scheduler to be deployed
+    in the account for the tag to take effect. Never applies to cloud."""
+    repo = os.path.abspath(repo_path or _default_repo())
+    rec = scheduling.get_schedule_recommendation_by_id(recommendation_id)
+    if not rec:
+        return json.dumps({"error": f"unknown schedule recommendation id: {recommendation_id}"})
+
+    result: dict[str, Any] = {"recommendation_id": recommendation_id, "resource": rec["resource_name"]}
+
+    if rec.get("externally_managed"):
+        result["status"] = "blocked_by_safety_precheck"
+        result["reason"] = rec.get("metrics", {}).get("skip_note", "lifecycle managed externally")
+        return json.dumps(result, indent=2, default=str)
+
+    mapping = mapper.map_schedule_target(repo, rec)
+    result["mapping"] = mapping
+    if not mapping.get("found"):
+        result["status"] = "mapping_failed"
+        return json.dumps(result, indent=2, default=str)
+
+    try:
+        scope = (
+            rf'resource\s+"{mapping["terraform_type"]}"\s+'
+            rf'"{mapping["terraform_name"]}"\s*'
+        )
+        change = patcher.upsert_schedule_tag(
+            mapping["declaration_file"], scope, rec["recommended"]["schedule"]
+        )
+        result["changes"] = [change]
+    except patcher.SafetyViolation as e:
+        result["status"] = "blocked_by_safety_precheck"
+        result["reason"] = str(e)
+        return json.dumps(result, indent=2, default=str)
+
+    if not change.get("changed"):
+        result["status"] = "no_changes_needed"
+        return json.dumps(result, indent=2, default=str)
+
+    verification = verifier.verify(repo, [change["file"]])
+    result["verification"] = {
+        "passed": verification["passed"],
+        "diff_scope_passed": verification["diff_scope"]["passed"],
+        "hcl_lint_passed": verification["hcl_lint"]["passed"],
+    }
+    if not verification["passed"]:
+        import subprocess
+
+        subprocess.run(["git", "checkout", "--", "."], cwd=repo, capture_output=True)
+        result["status"] = "verification_failed_rolled_back"
+        result["verification_detail"] = verification
+        return json.dumps(result, indent=2, default=str)
+
+    pr_body = gitops.build_pr_body(rec, [change], verification, action="schedule")
+    result["pr_body_file"] = gitops.write_pr_artifacts(repo, rec, pr_body)
+
+    if create_branch:
+        result["git"] = gitops.create_branch_and_commit(
+            repo, rec, [change], push=push, action="schedule"
+        )
+
+    result["status"] = "drafted"
+    return json.dumps(result, indent=2, default=str)
 
 
 def main() -> None:

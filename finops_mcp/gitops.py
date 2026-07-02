@@ -21,13 +21,14 @@ def create_branch_and_commit(
     rec: dict[str, Any],
     changes: list[dict[str, Any]],
     push: bool = False,
+    action: str = "rightsize",
 ) -> dict[str, Any]:
     if not ensure_repo(repo_path):
         return {"ok": False, "error": f"{repo_path} is not a git repository"}
 
     stamp = datetime.date.today().strftime("%Y%m%d")
-    branch = f"finops/rightsize-{rec['resource_name']}-{stamp}"
-    title = f"chore(finops): rightsize {rec['resource_name']} ({rec['resource_type']}) for cost optimization"
+    branch = f"finops/{action}-{rec['resource_name']}-{stamp}"
+    title = f"chore(finops): {action} {rec['resource_name']} ({rec['resource_type']}) for cost optimization"
 
     r = _git(repo_path, "checkout", "-B", branch)
     if r.returncode != 0:
@@ -72,8 +73,9 @@ def build_pr_body(
     rec: dict[str, Any],
     changes: list[dict[str, Any]],
     verification: dict[str, Any],
+    action: str = "rightsize",
 ) -> str:
-    title = f"chore(finops): rightsize {rec['resource_name']} ({rec['resource_type']}) for cost optimization"
+    title = f"chore(finops): {action} {rec['resource_name']} ({rec['resource_type']}) for cost optimization"
 
     change_lines = "\n".join(
         f"- `{os.path.basename(c['file'])}` line {c['line']}: `{c['old']}` → `{c['new']}`"
@@ -101,7 +103,7 @@ def build_pr_body(
 - **Current Configuration:** {_fmt_config(rec['current'])}
 - **Optimized Configuration:** {_fmt_config(rec['recommended'])}
 - **Projected Savings:** ${rec['monthly_savings_usd']:,.2f}/month (~${rec['monthly_savings_usd'] * 12:,.2f}/year)
-- **Justification:** Compute Optimizer finding **{rec['finding']}** — {_fmt_metrics(rec['metrics'])}.
+- **Justification:** Finding **{rec['finding']}** — {_fmt_metrics(rec['metrics'])}.
 
 ## Changes
 
@@ -109,7 +111,7 @@ def build_pr_body(
 
 ## Verification Logs
 
-Verification passed: **{verification.get('passed')}** · Diff-scope guard: **{scope.get('passed')}** (only allowlisted rightsizing attributes touched)
+Verification passed: **{verification.get('passed')}** · Diff-scope guard: **{scope.get('passed')}** (only allowlisted attributes touched)
 
 ### {verif_label}
 
