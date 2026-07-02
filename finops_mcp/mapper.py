@@ -30,6 +30,11 @@ RESOURCE_BLOCK_TYPES = {
     "lambda_function": ["aws_lambda_function"],
 }
 
+SCHEDULE_BLOCK_TYPES = {
+    "ec2_schedule": ["aws_instance"],
+    "rds_schedule": ["aws_db_instance"],
+}
+
 
 def _iter_files(repo_path: str) -> list[str]:
     found = []
@@ -79,8 +84,7 @@ def _extract_attr(block_text: str, attr: str) -> Optional[str]:
 
 def _trace_variable(repo_path: str, var_expr: str) -> Optional[dict[str, Any]]:
     """If an attribute value is `var.foo`, find where foo gets its value:
-    terraform.tfvars first, then the variable's default. Returns the
-    patchable location, or None if the expression isn't a simple variable."""
+    terraform.tfvars first, then the variable's default."""
     m = re.match(r'^var\.([A-Za-z_][A-Za-z0-9_]*)$', var_expr)
     if not m:
         return None
@@ -121,10 +125,51 @@ def _trace_variable(repo_path: str, var_expr: str) -> Optional[dict[str, Any]]:
     return None
 
 
+def map_schedule_target(repo_path: str, rec: dict[str, Any]) -> dict[str, Any]:
+    """Locate the Terraform block for an instance-scheduling recommendation
+    (aws_instance / aws_db_instance) so the Schedule tag can be upserted."""
+    repo_path = os.path.abspath(repo_path)
+    if not os.path.isdir(repo_path):
+        return {"found": False, "error": f"repo path does not exist: {repo_path}"}
+
+    block_types = SCHEDULE_BLOCK_TYPES.get(rec["resource_type"], [])
+    for path in _iter_files(repo_path):
+        if not path.endswith(".tf"):
+            continue
+        content = open(path, encoding="utf-8").read()
+        for btype in block_types:
+            for header in re.finditer(
+                rf'resource\s+"{btype}"\s+"([A-Za-z0-9_-]+)"\s*\{{', content
+            ):
+                span = _find_block(
+                    content,
+                    rf'resource\s+"{btype}"\s+"{re.escape(header.group(1))}"\s*',
+                )
+                if not span:
+                    continue
+                block_text = content[span[0]: span[1]]
+                if not _block_matches_resource(block_text, rec):
+                    continue
+                return {
+                    "found": True,
+                    "resource_type": rec["resource_type"],
+                    "kind": "schedule_tag",
+                    "terraform_type": btype,
+                    "terraform_name": header.group(1),
+                    "declaration_file": path,
+                    "has_tags_map": bool(re.search(r'^\s*tags\s*=?\s*\{', block_text, re.MULTILINE)),
+                }
+    return {
+        "found": False,
+        "error": (
+            f"no declaration found for {rec['resource_type']} "
+            f"'{rec['resource_name']}' in {repo_path}"
+        ),
+    }
+
+
 def _map_helm_workload(repo_path: str, rec: dict[str, Any]) -> dict[str, Any]:
-    """Locate the Helm values.yaml governing a K8s workload. Matches a values
-    file whose parent chart directory is named after the workload, or whose
-    content references the workload name."""
+    """Locate the Helm values.yaml governing a K8s workload."""
     name = rec["resource_name"]
     candidates = []
     for path in _iter_files(repo_path):

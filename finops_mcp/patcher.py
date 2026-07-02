@@ -26,6 +26,7 @@ ALLOWED_ATTRS = {
     "memory",
     "memory_size",
     "desired_count",
+    "Schedule",  # scheduling tag (AWS Instance Scheduler-compatible)
 }
 
 # YAML leaf keys we may modify in Helm values files (pod/HPA rightsizing)
@@ -146,6 +147,67 @@ def patch_attribute(
         "line": _line_of(content, abs_offset),
         "old": old_expr,
         "new": new_expr,
+        "changed": True,
+    }
+
+
+def upsert_schedule_tag(
+    file_path: str,
+    scope_header_re: str,
+    tag_value: str,
+) -> dict[str, Any]:
+    """Insert (or update) `Schedule = "<value>"` inside the `tags` map of one
+    resource block. Additive, minimal diff. Requires an existing tags map —
+    creating whole new blocks is out of scope for safe automation.
+    """
+    content = open(file_path, encoding="utf-8").read()
+
+    from .mapper import _find_block
+
+    span = _find_block(content, scope_header_re)
+    if not span:
+        raise SafetyViolation(f"scoped block not found in {file_path}: {scope_header_re}")
+    block = content[span[0]: span[1]]
+
+    tm = re.search(r'^(\s*)tags\s*=?\s*\{', block, re.MULTILINE)
+    if not tm:
+        raise SafetyViolation(
+            f"no tags map found in target resource in {file_path}; "
+            "add a tags block first so the Schedule tag can be managed"
+        )
+
+    # If a Schedule tag already exists in this block, update it in place.
+    existing = re.search(
+        r'^(\s*)(Schedule)(\s*=\s*)(.+?)(\s*(?:#.*)?)$', block, re.MULTILINE
+    )
+    if existing:
+        old = existing.group(4).strip()
+        new = f'"{tag_value}"'
+        if old == new:
+            return {"file": file_path, "line": _line_of(content, span[0] + existing.start()),
+                    "old": old, "new": new, "changed": False}
+        new_line = f"{existing.group(1)}Schedule{existing.group(3)}{new}{existing.group(5)}"
+        new_block = block[: existing.start()] + new_line + block[existing.end():]
+        with open(file_path, "w", encoding="utf-8") as f:
+            f.write(content[: span[0]] + new_block + content[span[1]:])
+        return {"file": file_path, "line": _line_of(content, span[0] + existing.start()),
+                "old": old, "new": new, "changed": True}
+
+    # Insert right after the tags map opening brace, matching inner indentation.
+    brace_end = tm.end()  # position just after '{' within block
+    rest = block[brace_end:]
+    indent_m = re.search(r'\n(\s*)\S', rest)
+    inner_indent = indent_m.group(1) if indent_m else tm.group(1) + "  "
+    insertion = f'\n{inner_indent}Schedule = "{tag_value}"'
+    new_block = block[:brace_end] + insertion + block[brace_end:]
+
+    with open(file_path, "w", encoding="utf-8") as f:
+        f.write(content[: span[0]] + new_block + content[span[1]:])
+    return {
+        "file": file_path,
+        "line": _line_of(content, span[0] + brace_end) + 1,
+        "old": "(no Schedule tag)",
+        "new": f'"{tag_value}"',
         "changed": True,
     }
 
