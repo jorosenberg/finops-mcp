@@ -78,7 +78,7 @@ def build_pr_body(
     title = f"chore(finops): {action} {rec['resource_name']} ({rec['resource_type']}) for cost optimization"
 
     change_lines = "\n".join(
-        f"- `{os.path.basename(c['file'])}` line {c['line']}: `{c['old']}` → `{c['new']}`"
+        f"- `{os.path.basename(c['file'])}` line {c['line']}: `{c['old']}` -> `{c['new']}`"
         for c in changes if c.get("changed")
     ) or "- (no file changes)"
 
@@ -103,7 +103,7 @@ def build_pr_body(
 - **Current Configuration:** {_fmt_config(rec['current'])}
 - **Optimized Configuration:** {_fmt_config(rec['recommended'])}
 - **Projected Savings:** ${rec['monthly_savings_usd']:,.2f}/month (~${rec['monthly_savings_usd'] * 12:,.2f}/year)
-- **Justification:** Finding **{rec['finding']}** — {_fmt_metrics(rec['metrics'])}.
+- **Justification:** Finding **{rec['finding']}** - {_fmt_metrics(rec['metrics'])}.
 
 ## Changes
 
@@ -111,7 +111,7 @@ def build_pr_body(
 
 ## Verification Logs
 
-Verification passed: **{verification.get('passed')}** · Diff-scope guard: **{scope.get('passed')}** (only allowlisted attributes touched)
+Verification passed: **{verification.get('passed')}** - Diff-scope guard: **{scope.get('passed')}** (only allowlisted attributes touched)
 
 ### {verif_label}
 
@@ -126,7 +126,7 @@ Verification passed: **{verification.get('passed')}** · Diff-scope guard: **{sc
 ```
 
 ---
-*Generated automatically by finops-mcp. Review and merge — changes are never applied directly to the cloud environment.*
+*Generated automatically by finops-mcp. Review and merge - changes are never applied directly to the cloud environment.*
 """
 
 
