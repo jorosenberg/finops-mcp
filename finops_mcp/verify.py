@@ -52,18 +52,39 @@ def lint_hcl_files(files: list[str]) -> dict[str, Any]:
 
 
 def run_terraform_check(repo_path: str, plan: bool = False) -> dict[str, Any]:
+    import os
+
+    if os.environ.get("FINOPS_SKIP_TERRAFORM", "").lower() == "true":
+        return {"available": False, "note": "terraform check disabled via FINOPS_SKIP_TERRAFORM"}
+
     binary = _tf_binary()
     if not binary:
         return {"available": False, "note": "terraform/tofu binary not found; HCL lint used instead"}
+
+    # Bounded so a slow `terraform init` (provider downloads) can't stall the
+    # MCP call — on timeout we fall back to HCL lint instead of failing.
+    step_timeout = int(os.environ.get("FINOPS_TF_TIMEOUT", "45"))
 
     steps = {}
     ok = True
     for args in (["init", "-backend=false", "-input=false", "-no-color"],
                  ["validate", "-no-color"],
                  *([["plan", "-input=false", "-no-color", "-lock=false"]] if plan else [])):
-        proc = subprocess.run(
-            [binary, *args], cwd=repo_path, capture_output=True, text=True, timeout=300
-        )
+        try:
+            proc = subprocess.run(
+                [binary, *args], cwd=repo_path, capture_output=True, text=True,
+                timeout=step_timeout,
+            )
+        except subprocess.TimeoutExpired:
+            return {
+                "available": False,
+                "note": (
+                    f"`{binary} {args[0]}` exceeded {step_timeout}s "
+                    "(likely provider downloads) — skipped; HCL lint used instead. "
+                    "Run `terraform init` in the repo once, or raise FINOPS_TF_TIMEOUT."
+                ),
+                "steps": steps,
+            }
         steps[args[0]] = {
             "exit_code": proc.returncode,
             "stdout": proc.stdout[-4000:],
