@@ -51,25 +51,28 @@ def check_scheduler_deployed(region: Optional[str] = None) -> dict[str, Any]:
                 "note": "mock mode — assuming no scheduler deployed"}
 
     import boto3
+    from botocore.config import Config
 
+    cfg = Config(connect_timeout=5, read_timeout=10, retries={"max_attempts": 1})
     evidence = []
     r = region or "us-east-1"
     try:
-        lam = boto3.client("lambda", region_name=r)
+        lam = boto3.client("lambda", region_name=r, config=cfg)
         lam.get_function(FunctionName=LAMBDA_FUNCTION_NAME)
         evidence.append(f"lambda function {LAMBDA_FUNCTION_NAME}")
     except Exception:
         pass
     try:
-        events = boto3.client("events", region_name=r)
+        events = boto3.client("events", region_name=r, config=cfg)
         events.describe_rule(Name=LAMBDA_FUNCTION_NAME)
         evidence.append(f"eventbridge rule {LAMBDA_FUNCTION_NAME}")
     except Exception:
         pass
     try:
-        cfn = boto3.client("cloudformation", region_name=r)
+        cfn = boto3.client("cloudformation", region_name=r, config=cfg)
         pages = cfn.get_paginator("list_stacks").paginate(
-            StackStatusFilter=["CREATE_COMPLETE", "UPDATE_COMPLETE"]
+            StackStatusFilter=["CREATE_COMPLETE", "UPDATE_COMPLETE"],
+            PaginationConfig={"MaxItems": 300},  # bounded — don't stall the MCP call
         )
         for page in pages:
             for st in page.get("StackSummaries", []):
