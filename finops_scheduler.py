@@ -2,7 +2,7 @@
 headlessly every Friday at 15:00 and logs to finops_pipeline.log.
 
 Calls run_finops_cycle directly (in-process) rather than shelling out to an
-agent CLI — simpler, no extra dependency on an agent runner being installed.
+agent CLI - simpler, no extra dependency on an agent runner being installed.
 Requires: pip install schedule
 """
 

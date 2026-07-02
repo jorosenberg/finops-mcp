@@ -58,7 +58,7 @@ resource "aws_db_instance" "orders" {
   allocated_storage = 500
 
   username = "app"
-  password = var.db_password # sensitive — never modified by automation
+  password = var.db_password # sensitive - never modified by automation
 
   tags = {
     Team = "orders"

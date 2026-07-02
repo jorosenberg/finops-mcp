@@ -1,14 +1,14 @@
 """finops-mcp server: FastMCP entrypoint exposing the optimization pipeline.
 
 Tools:
-  get_cost_recommendations   — Step 1: telemetry ingestion (AWS or mock)
-  map_resource_to_code       — Step 2: locate the resource in local IaC
-  draft_optimization         — Steps 3–4 for one recommendation: patch + verify + PR body
-  run_finops_cycle           — full loop over all recommendations (Trigger A/B)
-  verify_repository          — standalone verification of a repo's current state
-  analyze_usage_windows      — detect recurring idle windows on EC2/RDS
-  draft_schedule             — upsert Schedule tag for a schedule recommendation
-  draft_scheduler_bootstrap  — generate the tag-driven scheduler as new Terraform
+  get_cost_recommendations   - Step 1: telemetry ingestion (AWS or mock)
+  map_resource_to_code       - Step 2: locate the resource in local IaC
+  draft_optimization         - Steps 3-4 for one recommendation: patch + verify + PR body
+  run_finops_cycle           - full loop over all recommendations (Trigger A/B)
+  verify_repository          - standalone verification of a repo's current state
+  analyze_usage_windows      - detect recurring idle windows on EC2/RDS
+  draft_schedule             - upsert Schedule tag for a schedule recommendation
+  draft_scheduler_bootstrap  - generate the tag-driven scheduler as new Terraform
 
 Run: `python -m finops_mcp.server` (stdio) or `finops-mcp` after pip install.
 """
@@ -46,7 +46,7 @@ def get_cost_recommendations(
     region: Optional[str] = None,
     min_monthly_savings: Optional[float] = None,
 ) -> str:
-    """Step 1 — Fetch over-provisioning recommendations from AWS Compute
+    """Step 1 - Fetch over-provisioning recommendations from AWS Compute
     Optimizer (falls back to mock data when no AWS credentials are available;
     controlled by FINOPS_MODE=aws|mock|auto).
 
@@ -65,7 +65,7 @@ def get_cost_recommendations(
 
 @mcp.tool()
 def map_resource_to_code(recommendation_id: str, repo_path: Optional[str] = None) -> str:
-    """Step 2 — Locate where the recommended resource is declared in the local
+    """Step 2 - Locate where the recommended resource is declared in the local
     codebase: Terraform/OpenTofu (*.tf, *.tfvars) for AWS resources, or Helm
     values.yaml for K8s workloads. Traces variable indirection to its true
     source (tfvars assignment or variable default)."""
@@ -84,7 +84,7 @@ def draft_optimization(
     push: bool = False,
     run_plan: bool = False,
 ) -> str:
-    """Steps 3–4 — For one recommendation: apply the minimal rightsizing patch,
+    """Steps 3-4 - For one recommendation: apply the minimal rightsizing patch,
     run local verification (terraform validate/plan when available, HCL/YAML
     lint otherwise, plus a diff-scope drift guard), and generate the structured
     PR body. Optionally commits to a new finops/* branch. Never applies to cloud.
@@ -119,7 +119,7 @@ def draft_optimization(
     }
 
     if not verification["passed"]:
-        # roll back working-tree changes — never leave a broken tree behind
+        # roll back working-tree changes - never leave a broken tree behind
         import subprocess
 
         subprocess.run(["git", "checkout", "--", "."], cwd=repo, capture_output=True)
@@ -147,11 +147,11 @@ def run_finops_cycle(
     min_monthly_savings: Optional[float] = None,
     push: bool = False,
 ) -> str:
-    """Full optimization loop (Steps 1–4) over every significant recommendation.
+    """Full optimization loop (Steps 1-4) over every significant recommendation.
 
     mode="interactive" (Trigger A): returns detailed per-step results for
       review in chat; creates branches but does not push.
-    mode="scheduled" (Trigger B): headless — additionally appends a structured
+    mode="scheduled" (Trigger B): headless - additionally appends a structured
       entry to finops_run_log.json and pushes branches when push=True.
     """
     repo = os.path.abspath(repo_path or _default_repo())
@@ -222,7 +222,7 @@ def analyze_usage_windows(
     lookback_days: int = 14,
     min_monthly_savings: Optional[float] = None,
 ) -> str:
-    """Scheduling Step 1 — Analyze EC2/RDS usage timing (CloudWatch hourly
+    """Scheduling Step 1 - Analyze EC2/RDS usage timing (CloudWatch hourly
     metrics folded into an hour-of-week profile; mock profiles without AWS
     credentials) and recommend start/stop schedules for resources with
     recurring idle windows (e.g. "running Mon-Fri 07-20, stopped nights and
@@ -245,7 +245,7 @@ def draft_schedule(
     push: bool = False,
     schedule_override: Optional[str] = None,
 ) -> str:
-    """Scheduling Steps 2-4 — For one schedule recommendation: locate the
+    """Scheduling Steps 2-4 - For one schedule recommendation: locate the
     aws_instance / aws_db_instance block in Terraform, upsert a
     `Schedule = "<window>"` tag, verify, and draft the PR branch.
 
@@ -282,7 +282,7 @@ def draft_schedule(
     result["scheduler_deployed"] = detection
     if not detection.get("deployed"):
         result["warning"] = (
-            "no tag-driven scheduler detected in the account — the Schedule tag "
+            "no tag-driven scheduler detected in the account - the Schedule tag "
             "will have no effect until one is deployed (see draft_scheduler_bootstrap)"
         )
 
@@ -355,7 +355,7 @@ def draft_scheduler_bootstrap(
     15 minutes via EventBridge and starts/stops EC2/RDS instances whose
     `Schedule` tag matches a defined window.
 
-    Never deploys to the cloud — the generated code is drafted on a
+    Never deploys to the cloud - the generated code is drafted on a
     finops/bootstrap-* branch for review and applied via your normal
     terraform workflow. Skips when a scheduler is already detected in the
     account (override with force=True).

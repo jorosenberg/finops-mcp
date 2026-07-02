@@ -1,5 +1,5 @@
 # --- EC2: dev-runner --------------------------------------------------------
-# Non-prod build box, idle nights and weekends — scheduling candidate.
+# Non-prod build box, idle nights and weekends - scheduling candidate.
 
 resource "aws_instance" "dev_runner" {
   ami           = "ami-0abcdef1234567890"
@@ -24,7 +24,7 @@ resource "aws_db_instance" "staging" {
   allocated_storage = 100
 
   username = "app"
-  password = var.db_password # sensitive — never modified by automation
+  password = var.db_password # sensitive - never modified by automation
 
   tags = {
     Name        = "staging-db"
