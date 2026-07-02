@@ -1,6 +1,6 @@
 # finops-mcp
 
-An [MCP](https://modelcontextprotocol.io) server for automated AWS cost optimization. It ingests AWS Compute Optimizer over-provisioning recommendations (EKS nodegroups, RDS instances, ECS services, Lambda functions) plus Kubernetes pod/HPA rightsizing, maps them to your local Terraform/OpenTofu codebase or Helm values.yaml, applies minimal safe rightsizing patches, verifies them locally, and drafts Git branches with structured PR bodies. It can also detect recurring idle windows on EC2/RDS and draft start/stop schedules.
+An [MCP](https://modelcontextprotocol.io) server for automated AWS cost optimization. It ingests AWS Compute Optimizer over-provisioning recommendations (EKS nodegroups, RDS instances, ECS services, Lambda functions) plus Kubernetes pod/HPA rightsizing, maps them to your local Terraform/OpenTofu codebase or Helm values.yaml, applies minimal safe rightsizing patches, verifies them locally, and drafts Git branches with structured PR bodies. It can also detect recurring idle windows on EC2/RDS and draft start/stop schedules — and generate the scheduler infrastructure itself when none exists.
 
 **It never applies changes to your cloud environment directly.** All output is code changes on local branches for human review.
 
@@ -28,7 +28,8 @@ AWS Compute Optimizer ──▶ 1. Telemetry ingestion (filter significant, safe
 | `run_finops_cycle` | Full loop over all recommendations; `mode="interactive"` or `mode="scheduled"` (writes `finops_run_log.json`) |
 | `verify_repository` | Standalone lint / `terraform validate` / diff-scope check of a repo |
 | `analyze_usage_windows` | Detect recurring idle windows on EC2/RDS from CloudWatch hour-of-week profiles and recommend start/stop schedules |
-| `draft_schedule` | Upsert an AWS Instance Scheduler-compatible `Schedule` tag in Terraform for one schedule recommendation, verify, draft PR branch |
+| `draft_schedule` | Upsert a `Schedule` tag in Terraform for one schedule recommendation (optionally with a user-preferred `schedule_override`), verify, draft PR branch |
+| `draft_scheduler_bootstrap` | Generate the tag-driven scheduler itself (Lambda + EventBridge + IAM + schedule definitions) as new Terraform files on a `finops/bootstrap-*` branch when none is detected in the account |
 
 ## Install
 
@@ -86,14 +87,19 @@ Claude Code: `claude mcp add finops-optimizer -- python -m finops_mcp.server`
 - Only allowlisted rightsizing attributes are ever patched — Terraform: `instance_type(s)`, `instance_class`, `min/max/desired_size`, `allocated_storage`, `cpu`, `memory`, `memory_size`, `desired_count`, `Schedule` tag; YAML: `cpu`, `memory`, `minReplicas`, `maxReplicas`, `replicas`, `replicaCount`
 - Secret-bearing lines (password/token/key), VPC/subnet/security-group blocks, and `backend` state configuration are never modified — enforced at patch time and re-checked by a diff-scope guard over `git diff`
 - Resources whose lifecycle is managed externally (e.g. Karpenter nodepools, ASG members) are detected and skipped
-- Failed verification automatically rolls back the working tree
-- Each recommendation gets its own isolated `finops/rightsize-*` or `finops/schedule-*` branch; nothing is pushed unless explicitly requested
+- Failed verification automatically rolls back the working tree (generated bootstrap files are deleted on failure)
+- Each recommendation gets its own isolated `finops/rightsize-*`, `finops/schedule-*`, or `finops/bootstrap-*` branch; nothing is pushed unless explicitly requested
+- Bootstrap generation refuses to overwrite existing files that don't look finops-generated
 
 ## Instance scheduling (usage timing)
 
 `analyze_usage_windows` pulls hourly CloudWatch metrics (EC2 `CPUUtilization`, RDS `DatabaseConnections`) over a lookback window, folds them into a 168-slot hour-of-week profile, and recommends start/stop schedules for resources with recurring idle windows (an hour counts as idle when it was idle in ≥90% of observed weeks, tunable via `FINOPS_IDLE_CONFIDENCE`; minimum recurring idle time `FINOPS_MIN_IDLE_HOURS_WEEK`, default 40h/week).
 
-`draft_schedule` enforces the schedule GitOps-style: it upserts a `Schedule = "<window>"` tag into the resource's Terraform `tags` map — compatible with [AWS Instance Scheduler](https://aws.amazon.com/solutions/implementations/instance-scheduler-on-aws/) and other tag-driven schedulers, which must be deployed once per account for the tag to take effect.
+`draft_schedule` enforces the schedule GitOps-style: it upserts a `Schedule = "<window>"` tag into the resource's Terraform `tags` map — compatible with [AWS Instance Scheduler](https://aws.amazon.com/solutions/implementations/instance-scheduler-on-aws/) and other tag-driven schedulers.
+
+Prefer a different window than the telemetry-derived one? Pass `schedule_override` to `draft_schedule` (formats: `mon-fri-HH-HH`, `daily-HH-HH`, `sat-sun-HH-HH`).
+
+**No scheduler in the account yet?** `draft_schedule` detects this (read-only probe for a scheduler Lambda/EventBridge rule/Instance Scheduler stack) and warns in its output. `draft_scheduler_bootstrap` then generates a complete lightweight scheduler as new Terraform files in your repo — `finops-scheduler.tf` (Lambda + EventBridge 15-minute rule + IAM + a `locals` map of schedule definitions, timezone-aware) and `finops_scheduler_lambda.py` (the ~75-line reviewable Lambda source) — on a `finops/bootstrap-*` branch. You review and `terraform apply` it yourself; the MCP never deploys anything.
 
 Scheduling safety exclusions: EC2 instances in ASGs, RDS Multi-AZ/read replicas/Aurora members, resources tagged `Environment=prod/production`, and resources that already carry a `Schedule` tag. Savings estimates are compute-only (EBS/RDS storage still bills while stopped) from an approximate on-demand price table.
 
@@ -115,9 +121,10 @@ FINOPS_REPO_PATH=/path/to/repo python finops_scheduler.py
 cd sample-infra && git init -b main && git add -A && git commit -m initial && cd ..
 FINOPS_MODE=mock python -c "from finops_mcp import server; print(server.run_finops_cycle(repo_path='sample-infra'))"
 FINOPS_MODE=mock python -c "from finops_mcp import server; print(server.draft_schedule('rec-sched-ec2-dev-runner', repo_path='sample-infra'))"
+FINOPS_MODE=mock python -c "from finops_mcp import server; print(server.draft_scheduler_bootstrap(repo_path='sample-infra', timezone='America/New_York'))"
 ```
 
-Expected result: five rightsizing branches (EKS, RDS, ECS, Lambda, K8s) plus `finops/schedule-*` branches adding `Schedule` tags to dev-runner (mon-fri-07-20) and staging-db (mon-fri-06-22) — each with a PR body under `.finops/`.
+Expected result: five rightsizing branches (EKS, RDS, ECS, Lambda, K8s), `finops/schedule-*` branches adding `Schedule` tags to dev-runner and staging-db, and a `finops/bootstrap-*` branch containing the generated scheduler — each with a PR body under `.finops/`.
 
 ## Example PR body
 

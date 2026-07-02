@@ -8,6 +8,7 @@ Tools:
   verify_repository          — standalone verification of a repo's current state
   analyze_usage_windows      — detect recurring idle windows on EC2/RDS
   draft_schedule             — upsert Schedule tag for a schedule recommendation
+  draft_scheduler_bootstrap  — generate the tag-driven scheduler as new Terraform
 
 Run: `python -m finops_mcp.server` (stdio) or `finops-mcp` after pip install.
 """
@@ -20,7 +21,7 @@ from typing import Any, Optional
 
 from mcp.server.fastmcp import FastMCP
 
-from . import gitops, mapper, patcher, runlog, scheduling, telemetry, verify as verifier
+from . import bootstrap, gitops, mapper, patcher, runlog, scheduling, telemetry, verify as verifier
 
 mcp = FastMCP(
     "finops-optimizer",
@@ -242,18 +243,41 @@ def draft_schedule(
     repo_path: Optional[str] = None,
     create_branch: bool = True,
     push: bool = False,
+    schedule_override: Optional[str] = None,
 ) -> str:
-    """Scheduling Steps 2–4 — For one schedule recommendation: locate the
+    """Scheduling Steps 2-4 — For one schedule recommendation: locate the
     aws_instance / aws_db_instance block in Terraform, upsert a
-    `Schedule = "<window>"` tag (AWS Instance Scheduler-compatible), verify,
-    and draft the PR branch. Requires a tag-driven scheduler to be deployed
-    in the account for the tag to take effect. Never applies to cloud."""
+    `Schedule = "<window>"` tag, verify, and draft the PR branch.
+
+    schedule_override: replace the telemetry-derived window with a preferred
+      one, e.g. "mon-fri-06-22", "daily-08-18", "sat-sun-10-16".
+
+    Requires a tag-driven scheduler in the account for the tag to take effect
+    (checked; see draft_scheduler_bootstrap). Never applies to cloud."""
     repo = os.path.abspath(repo_path or _default_repo())
     rec = scheduling.get_schedule_recommendation_by_id(recommendation_id)
     if not rec:
         return json.dumps({"error": f"unknown schedule recommendation id: {recommendation_id}"})
 
     result: dict[str, Any] = {"recommendation_id": recommendation_id, "resource": rec["resource_name"]}
+
+    if schedule_override:
+        if not bootstrap.parse_schedule_name(schedule_override):
+            return json.dumps({
+                "error": f"invalid schedule_override '{schedule_override}' "
+                         "(expected mon-fri-HH-HH, daily-HH-HH, or sat-sun-HH-HH)"
+            })
+        rec["recommended"]["schedule"] = schedule_override
+        rec["recommended"]["schedule_description"] = f"user-preferred window {schedule_override}"
+        result["schedule_override"] = schedule_override
+
+    detection = bootstrap.check_scheduler_deployed(rec.get("region"))
+    result["scheduler_deployed"] = detection
+    if not detection.get("deployed"):
+        result["warning"] = (
+            "no tag-driven scheduler detected in the account — the Schedule tag "
+            "will have no effect until one is deployed (see draft_scheduler_bootstrap)"
+        )
 
     if rec.get("externally_managed"):
         result["status"] = "blocked_by_safety_precheck"
@@ -304,6 +328,91 @@ def draft_schedule(
     if create_branch:
         result["git"] = gitops.create_branch_and_commit(
             repo, rec, [change], push=push, action="schedule"
+        )
+
+    result["status"] = "drafted"
+    return json.dumps(result, indent=2, default=str)
+
+
+@mcp.tool()
+def draft_scheduler_bootstrap(
+    repo_path: Optional[str] = None,
+    schedules: Optional[list[str]] = None,
+    timezone: str = "UTC",
+    create_branch: bool = True,
+    push: bool = False,
+    force: bool = False,
+) -> str:
+    """Generate the tag-driven instance scheduler itself as NEW Terraform in
+    the repo (finops-scheduler.tf + Lambda source): a Lambda that runs every
+    15 minutes via EventBridge and starts/stops EC2/RDS instances whose
+    `Schedule` tag matches a defined window.
+
+    Never deploys to the cloud — the generated code is drafted on a
+    finops/bootstrap-* branch for review and applied via your normal
+    terraform workflow. Skips when a scheduler is already detected in the
+    account (override with force=True).
+
+    schedules: window names to define, e.g. ["mon-fri-07-20"]. Defaults to
+      every window currently recommended by analyze_usage_windows.
+    timezone: IANA timezone the windows are evaluated in, e.g. "America/New_York".
+    """
+    repo = os.path.abspath(repo_path or _default_repo())
+    result: dict[str, Any] = {}
+
+    detection = bootstrap.check_scheduler_deployed()
+    result["scheduler_deployed"] = detection
+    if detection.get("deployed") and not force:
+        result["status"] = "already_deployed"
+        result["note"] = "a scheduler already exists in the account; pass force=True to generate anyway"
+        return json.dumps(result, indent=2, default=str)
+
+    names = schedules
+    if not names:
+        recs = scheduling.get_schedule_recommendations()
+        names = sorted({r["recommended"]["schedule"] for r in recs["recommendations"]})
+    result["schedules"] = names
+
+    try:
+        changes = bootstrap.generate_bootstrap_files(repo, names, timezone=timezone)
+        result["changes"] = changes
+    except ValueError as e:
+        result["status"] = "blocked"
+        result["reason"] = str(e)
+        return json.dumps(result, indent=2, default=str)
+
+    verification = verifier.verify(repo, [c["file"] for c in changes])
+    result["verification"] = {
+        "passed": verification["passed"],
+        "hcl_lint_passed": verification["hcl_lint"]["passed"],
+        "diff_scope_passed": verification["diff_scope"]["passed"],
+    }
+    if not verification["passed"]:
+        for c in changes:
+            if os.path.exists(c["file"]):
+                os.remove(c["file"])
+        result["status"] = "verification_failed_rolled_back"
+        result["verification_detail"] = verification
+        return json.dumps(result, indent=2, default=str)
+
+    pseudo_rec = {
+        "id": "rec-bootstrap-scheduler",
+        "resource_name": "instance-scheduler",
+        "resource_type": "scheduler_bootstrap",
+        "resource_arn": "(new infrastructure)",
+        "current": {"scheduler": "not deployed"},
+        "recommended": {"scheduler": "finops Lambda scheduler", "schedules": ", ".join(names),
+                        "timezone": timezone},
+        "monthly_savings_usd": 0.0,
+        "metrics": {"note": "enables Schedule tags drafted by draft_schedule", "lookback_days": 0},
+        "finding": "SchedulerMissing",
+    }
+    pr_body = gitops.build_pr_body(pseudo_rec, changes, verification, action="bootstrap")
+    result["pr_body_file"] = gitops.write_pr_artifacts(repo, pseudo_rec, pr_body)
+
+    if create_branch:
+        result["git"] = gitops.create_branch_and_commit(
+            repo, pseudo_rec, changes, push=push, action="bootstrap"
         )
 
     result["status"] = "drafted"
